@@ -16,11 +16,13 @@ from io import BytesIO
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "qwen2.5:7b")
-OCR_LANG        = os.getenv("OCR_LANG",        "en")
-OCR_CONF_THRESH = float(os.getenv("OCR_CONF_THRESH", "0.4"))
-MAX_IMAGE_PX    = int(os.getenv("MAX_IMAGE_PX", "2048"))
+OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL",    "qwen2.5:3b")
+OLLAMA_TIMEOUT_SEC = float(os.getenv("OLLAMA_TIMEOUT_SEC", "300"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "2500"))
+OCR_LANG          = os.getenv("OCR_LANG",        "en")
+OCR_CONF_THRESH   = float(os.getenv("OCR_CONF_THRESH", "0.4"))
+MAX_IMAGE_PX      = int(os.getenv("MAX_IMAGE_PX", "2048"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -91,8 +93,14 @@ def get_ocr():
     from paddleocr import PaddleOCR
 
     if _paddle_major >= 3:
-        # v3.x — disable MKLDNN to avoid PIR/oneDNN crash on CPU (Paddle 3.3+)
-        _ocr_engine = PaddleOCR(lang=OCR_LANG, enable_mkldnn=False)
+        # v3.x — skip doc-orientation + unwarping (EXIF + flat receipts); keep
+        # server det/rec models and textline orientation for accuracy.
+        _ocr_engine = PaddleOCR(
+            lang=OCR_LANG,
+            enable_mkldnn=False,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+        )
     else:
         # v2.x — richer init options
         _ocr_engine = PaddleOCR(
@@ -249,32 +257,80 @@ Return this exact JSON schema (null for missing fields, plain numbers for amount
 }}
 """
 
+_REPAIR_PROMPT = """\
+The JSON below is malformed or truncated. Fix it and return ONLY a valid JSON object
+with the same receipt fields and data. No markdown, no explanation.
 
-async def call_ollama(ocr_text: str) -> str:
-    async with httpx.AsyncClient(timeout=300.0) as client:
+BROKEN JSON:
+{raw}
+"""
+
+
+def _strip_json_fences(raw: str) -> str:
+    cleaned = re.sub(r"```(?:json)?", "", raw).strip()
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    return m.group() if m else cleaned
+
+
+def safe_parse_json(raw: str) -> dict:
+    """Parse LLM JSON with json-repair fallback for truncated/malformed output."""
+    cleaned = _strip_json_fences(raw)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        log.warning("JSON parse failed (%s), attempting json-repair", exc)
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(cleaned)
+            return json.loads(repaired)
+        except Exception as repair_exc:
+            log.error(
+                "JSON repair failed. Raw LLM output (first 800 chars):\n%s",
+                raw[:800],
+            )
+            raise ValueError(f"Invalid JSON from LLM: {exc}") from repair_exc
+
+
+async def _ollama_generate(prompt: str, *, temperature: float = 0.05) -> str:
+    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
         resp = await client.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json={
                 "model":  OLLAMA_MODEL,
-                "prompt": _PROMPT.format(ocr_text=ocr_text),
+                "prompt": prompt,
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0.05, "top_p": 0.9, "num_predict": 1200},
+                "options": {
+                    "temperature": temperature,
+                    "top_p":       0.9,
+                    "num_predict": OLLAMA_NUM_PREDICT,
+                },
             },
         )
         resp.raise_for_status()
     return resp.json()["response"]
 
 
-def safe_parse_json(raw: str) -> dict:
-    cleaned = re.sub(r"```(?:json)?", "", raw).strip()
+async def call_ollama(ocr_text: str) -> str:
+    return await _ollama_generate(_PROMPT.format(ocr_text=ocr_text))
+
+
+async def call_ollama_repair(raw: str) -> str:
+    return await _ollama_generate(
+        _REPAIR_PROMPT.format(raw=raw[:4000]),
+        temperature=0.0,
+    )
+
+
+async def extract_receipt_json(ocr_text: str) -> dict:
+    """Run LLM extraction with json-repair and a second LLM pass if needed."""
+    raw = await call_ollama(ocr_text)
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if m:
-            return json.loads(m.group())
-        raise ValueError(f"No valid JSON in LLM output: {cleaned[:300]}")
+        return safe_parse_json(raw)
+    except ValueError:
+        log.info("LLM JSON still invalid after repair — retrying with fix pass")
+        raw = await call_ollama_repair(raw)
+        return safe_parse_json(raw)
 
 
 def _to_float(v) -> Optional[float]:
@@ -322,33 +378,37 @@ async def extract_receipt(
     t0 = time.monotonic()
 
     # Step 1 — OCR
+    t_ocr = time.monotonic()
     try:
         img_arr  = preprocess(image_bytes)
         ocr_text = run_ocr(img_arr)
     except Exception as exc:
         log.exception("OCR stage failed")
         raise HTTPException(500, f"OCR error: {exc}")
+    ocr_ms = _ms(t_ocr)
 
     if not ocr_text.strip():
         return ExtractResponse(success=False, error="OCR returned no text.", latency_ms=_ms(t0))
 
-    log.info("OCR: %d chars from '%s'", len(ocr_text), file.filename)
+    log.info("OCR: %d chars from '%s' in %d ms", len(ocr_text), file.filename, ocr_ms)
     log.debug("OCR text:\n%s", ocr_text)
 
     # Step 2 — LLM
+    t_llm = time.monotonic()
     try:
-        raw_json  = await call_ollama(ocr_text)
-        data_dict = safe_parse_json(raw_json)
+        data_dict = await extract_receipt_json(ocr_text)
     except httpx.ConnectError:
         raise HTTPException(503, f"Cannot reach Ollama at {OLLAMA_BASE_URL} — is `ollama serve` running?")
     except httpx.HTTPStatusError as exc:
         raise HTTPException(502, f"Ollama {exc.response.status_code}: {exc.response.text[:200]}")
     except Exception as exc:
-        log.exception("LLM stage failed")
+        log.exception("LLM stage failed after %d ms", _ms(t_llm))
         return ExtractResponse(
             success=False, ocr_text=ocr_text if debug else None,
             error=f"LLM error: {exc}", latency_ms=_ms(t0),
         )
+    llm_ms = _ms(t_llm)
+    log.info("LLM: parsed receipt in %d ms (total %d ms)", llm_ms, _ms(t0))
 
     # Step 3 — Build typed response
     try:
