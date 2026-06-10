@@ -4,7 +4,7 @@ import re
 import time
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional, List
+from typing import Optional
 
 import httpx
 import numpy as np
@@ -16,13 +16,15 @@ from io import BytesIO
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
-OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL",    "qwen2.5:3b")
+OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL", "http://10.10.206.4:11434")
+OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL",    "qwen2.5:latest")
 OLLAMA_TIMEOUT_SEC = float(os.getenv("OLLAMA_TIMEOUT_SEC", "300"))
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "2500"))
-OCR_LANG          = os.getenv("OCR_LANG",        "en")
-OCR_CONF_THRESH   = float(os.getenv("OCR_CONF_THRESH", "0.4"))
-MAX_IMAGE_PX      = int(os.getenv("MAX_IMAGE_PX", "2048"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "200"))
+OCR_LANG           = os.getenv("OCR_LANG",        "en")
+OCR_CONF_THRESH    = float(os.getenv("OCR_CONF_THRESH", "0.4"))
+MAX_IMAGE_PX       = int(os.getenv("MAX_IMAGE_PX", "1600"))
+OCR_TRIM_LINES     = int(os.getenv("OCR_TRIM_LINES", "15"))
+OCR_TRIM_MIN_CHARS = int(os.getenv("OCR_TRIM_MIN_CHARS", "1500"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -33,35 +35,21 @@ log = logging.getLogger("receipt-extractor")
 
 # ─── Pydantic models ───────────────────────────────────────────────────────────
 
-class LineItem(BaseModel):
-    name:   str
-    qty:    Optional[float] = None
-    rate:   Optional[float] = None
-    amount: Optional[float] = None
-
-class TaxEntry(BaseModel):
-    name:   str
-    rate:   Optional[str]   = None
-    amount: Optional[float] = None
-
-class ReceiptData(BaseModel):
+class ExpenseClaimData(BaseModel):
     merchant_name: Optional[str]   = None
     bill_number:   Optional[str]   = None
     date:          Optional[str]   = None
-    items:         List[LineItem]  = []
     sub_total:     Optional[float] = None
-    discount:      Optional[float] = None
-    taxes:         List[TaxEntry]  = []
+    tax_amount:    Optional[float] = None
     total_amount:  Optional[float] = None
     currency:      Optional[str]   = None
-    payment_mode:  Optional[str]   = None
 
 class ExtractResponse(BaseModel):
     success:    bool
-    data:       Optional[ReceiptData] = None
-    ocr_text:   Optional[str]         = None
-    latency_ms: Optional[int]         = None
-    error:      Optional[str]         = None
+    data:       Optional[ExpenseClaimData] = None
+    ocr_text:   Optional[str]              = None
+    latency_ms: Optional[int]              = None
+    error:      Optional[str]              = None
 
 
 # ─── PaddleOCR: version-aware singleton ───────────────────────────────────────
@@ -76,6 +64,13 @@ def _detect_paddle_major() -> int:
         return int(getattr(_pm, "__version__", "2.0.0").split(".")[0])
     except Exception:
         return 2
+
+
+def _rec_model_name() -> str:
+    """Use language-specific mobile rec model for better English accuracy."""
+    if OCR_LANG == "en":
+        return "en_PP-OCRv5_mobile_rec"
+    return "PP-OCRv5_mobile_rec"
 
 
 def get_ocr():
@@ -93,13 +88,14 @@ def get_ocr():
     from paddleocr import PaddleOCR
 
     if _paddle_major >= 3:
-        # v3.x — skip doc-orientation + unwarping (EXIF + flat receipts); keep
-        # server det/rec models and textline orientation for accuracy.
+        # v3.x — hybrid: accurate server det + lang-specific mobile rec
         _ocr_engine = PaddleOCR(
             lang=OCR_LANG,
             enable_mkldnn=False,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
+            text_detection_model_name="PP-OCRv5_server_det",
+            text_recognition_model_name=_rec_model_name(),
         )
     else:
         # v2.x — richer init options
@@ -136,18 +132,15 @@ def run_ocr(img_arr: np.ndarray) -> str:
 
     PaddleOCR v2  →  ocr(img, cls=True)  →  list[ list[ [bbox,(text,conf)] ] ]
     PaddleOCR v3  →  predict(img)        →  list[ dict{dt_polys, rec_texts, …} ]
-
-    Both paths feed into the same row-clustering logic.
     """
     engine = get_ocr()
     blocks = []
 
     if _paddle_major >= 3:
-        # v3 uses predict()
         results = engine.predict(img_arr)
         if not results:
             return ""
-        page = results[0]  # single-image → first (only) page
+        page = results[0]
 
         rec_texts  = page.get("rec_texts",  [])
         rec_scores = page.get("rec_scores", [1.0] * len(rec_texts))
@@ -158,7 +151,7 @@ def run_ocr(img_arr: np.ndarray) -> str:
             if conf < OCR_CONF_THRESH:
                 continue
             if i < len(dt_polys):
-                box = dt_polys[i]           # shape (4, 2) or list of 4 [x,y]
+                box = dt_polys[i]
                 xs  = [float(p[0]) for p in box]
                 ys  = [float(p[1]) for p in box]
                 blocks.append({
@@ -168,7 +161,6 @@ def run_ocr(img_arr: np.ndarray) -> str:
                     "height":   max(ys) - min(ys),
                 })
             else:
-                # no bbox — append sequentially so text isn't lost
                 blocks.append({
                     "text":     text,
                     "x_min":    0.0,
@@ -177,7 +169,6 @@ def run_ocr(img_arr: np.ndarray) -> str:
                 })
 
     else:
-        # v2 uses ocr()
         result = engine.ocr(img_arr, cls=True)
         if not result or not result[0]:
             return ""
@@ -198,11 +189,7 @@ def run_ocr(img_arr: np.ndarray) -> str:
 
 
 def _cluster_and_join(blocks: list) -> str:
-    """
-    Sort blocks top→bottom, cluster into rows by Y proximity, then join each
-    row left→right with two spaces.  Keeps 'Item  Qty  Rate  Amount' on one line
-    so the LLM can parse multi-column receipt tables correctly.
-    """
+    """Sort blocks into reading order and join as plain text lines."""
     if not blocks:
         return ""
 
@@ -228,38 +215,55 @@ def _cluster_and_join(blocks: list) -> str:
     return "\n".join(lines)
 
 
+def trim_ocr_for_llm(ocr_text: str, n_lines: int = OCR_TRIM_LINES) -> str:
+    """
+    Keep header (merchant, bill no) and footer (totals, tax) for the LLM.
+    Only trim long receipts — short/medium OCR text is sent in full.
+    """
+    if len(ocr_text) <= OCR_TRIM_MIN_CHARS:
+        return ocr_text
+    lines = [ln for ln in ocr_text.splitlines() if ln.strip()]
+    if len(lines) <= n_lines * 2:
+        return ocr_text
+    omitted = len(lines) - (n_lines * 2)
+    trimmed = lines[:n_lines] + [f"... ({omitted} item lines omitted) ..."] + lines[-n_lines:]
+    return "\n".join(trimmed)
+
+
 # ─── Ollama call ──────────────────────────────────────────────────────────────
 
-_PROMPT = """\
-You are a receipt data extraction assistant.
-The text below was extracted by OCR from a receipt image.
-Extract the fields and return ONLY a valid JSON object — no markdown, no explanation.
+_EXPENSE_PROMPT = """\
+Extract expense claim fields from receipt OCR text.
+Return ONLY valid JSON — no markdown, no explanation.
+
+Rules:
+- merchant_name: store or restaurant name (usually first lines)
+- bill_number: invoice/bill/receipt number (any label: Bill No, Invoice #, etc.)
+- sub_total: amount before tax (Subtotal, Total before tax, etc.)
+- tax_amount: total tax (sum CGST+SGST+VAT+Service Tax etc. if multiple lines)
+- total_amount: final amount paid (Grand Total, Net Amount, Amount Due, etc.)
+- currency: 3-letter code if inferable (INR, USD, EUR), else null
+- date: bill date if present, else null
+- Use plain numbers for amounts, null if not found
 
 OCR TEXT:
 {ocr_text}
 
-Return this exact JSON schema (null for missing fields, plain numbers for amounts):
+JSON:
 {{
-  "merchant_name": "string or null",
-  "bill_number":   "string or null",
-  "date":          "string or null",
-  "items": [
-    {{"name": "string", "qty": number_or_null, "rate": number_or_null, "amount": number_or_null}}
-  ],
-  "sub_total":    number_or_null,
-  "discount":     number_or_null,
-  "taxes": [
-    {{"name": "CGST/SGST/VAT/Sales Tax/etc", "rate": "percent string or null", "amount": number_or_null}}
-  ],
-  "total_amount": number_or_null,
-  "currency":     "INR or USD or other 3-letter code or null",
-  "payment_mode": "Cash or Card or UPI or null"
+  "merchant_name": null,
+  "bill_number": null,
+  "date": null,
+  "sub_total": null,
+  "tax_amount": null,
+  "total_amount": null,
+  "currency": null
 }}
 """
 
 _REPAIR_PROMPT = """\
-The JSON below is malformed or truncated. Fix it and return ONLY a valid JSON object
-with the same receipt fields and data. No markdown, no explanation.
+Fix this malformed JSON. Return ONLY valid JSON with these fields:
+merchant_name, bill_number, date, sub_total, tax_amount, total_amount, currency
 
 BROKEN JSON:
 {raw}
@@ -273,7 +277,7 @@ def _strip_json_fences(raw: str) -> str:
 
 
 def safe_parse_json(raw: str) -> dict:
-    """Parse LLM JSON with json-repair fallback for truncated/malformed output."""
+    """Parse LLM JSON with json-repair fallback for malformed output."""
     cleaned = _strip_json_fences(raw)
     try:
         return json.loads(cleaned)
@@ -311,20 +315,25 @@ async def _ollama_generate(prompt: str, *, temperature: float = 0.05) -> str:
     return resp.json()["response"]
 
 
-async def call_ollama(ocr_text: str) -> str:
-    return await _ollama_generate(_PROMPT.format(ocr_text=ocr_text))
+async def call_ollama_expense(ocr_text: str) -> str:
+    return await _ollama_generate(_EXPENSE_PROMPT.format(ocr_text=ocr_text))
 
 
 async def call_ollama_repair(raw: str) -> str:
     return await _ollama_generate(
-        _REPAIR_PROMPT.format(raw=raw[:4000]),
+        _REPAIR_PROMPT.format(raw=raw[:1500]),
         temperature=0.0,
     )
 
 
-async def extract_receipt_json(ocr_text: str) -> dict:
-    """Run LLM extraction with json-repair and a second LLM pass if needed."""
-    raw = await call_ollama(ocr_text)
+async def extract_expense_json(ocr_text: str) -> dict:
+    """Run slim LLM extraction with json-repair and a second pass if needed."""
+    trimmed = trim_ocr_for_llm(ocr_text)
+    log.info(
+        "LLM input: %d chars (trimmed from %d)",
+        len(trimmed), len(ocr_text),
+    )
+    raw = await call_ollama_expense(trimmed)
     try:
         return safe_parse_json(raw)
     except ValueError:
@@ -354,9 +363,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Receipt Extractor API",
-    description="PaddleOCR + Ollama — fully offline receipt data extraction",
-    version="1.1.0",
+    title="Expense Claim Extractor API",
+    description="Fast receipt OCR + Ollama — merchant, bill #, subtotal, tax, total",
+    version="2.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -393,10 +402,10 @@ async def extract_receipt(
     log.info("OCR: %d chars from '%s' in %d ms", len(ocr_text), file.filename, ocr_ms)
     log.debug("OCR text:\n%s", ocr_text)
 
-    # Step 2 — LLM
+    # Step 2 — LLM (slim expense schema)
     t_llm = time.monotonic()
     try:
-        data_dict = await extract_receipt_json(ocr_text)
+        data_dict = await extract_expense_json(ocr_text)
     except httpx.ConnectError:
         raise HTTPException(503, f"Cannot reach Ollama at {OLLAMA_BASE_URL} — is `ollama serve` running?")
     except httpx.HTTPStatusError as exc:
@@ -408,21 +417,18 @@ async def extract_receipt(
             error=f"LLM error: {exc}", latency_ms=_ms(t0),
         )
     llm_ms = _ms(t_llm)
-    log.info("LLM: parsed receipt in %d ms (total %d ms)", llm_ms, _ms(t0))
+    log.info("LLM: parsed expense fields in %d ms (total %d ms)", llm_ms, _ms(t0))
 
     # Step 3 — Build typed response
     try:
-        receipt = ReceiptData(
+        claim = ExpenseClaimData(
             merchant_name = data_dict.get("merchant_name"),
             bill_number   = data_dict.get("bill_number"),
             date          = data_dict.get("date"),
-            items  = [LineItem(**i) for i in (data_dict.get("items")  or [])],
             sub_total     = _to_float(data_dict.get("sub_total")),
-            discount      = _to_float(data_dict.get("discount")),
-            taxes  = [TaxEntry(**t) for t in (data_dict.get("taxes")  or [])],
+            tax_amount    = _to_float(data_dict.get("tax_amount")),
             total_amount  = _to_float(data_dict.get("total_amount")),
             currency      = data_dict.get("currency"),
-            payment_mode  = data_dict.get("payment_mode"),
         )
     except Exception as exc:
         return ExtractResponse(
@@ -431,7 +437,7 @@ async def extract_receipt(
         )
 
     return ExtractResponse(
-        success=True, data=receipt,
+        success=True, data=claim,
         ocr_text=ocr_text if debug else None,
         latency_ms=_ms(t0),
     )
