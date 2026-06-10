@@ -6,7 +6,10 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
+from dotenv import load_dotenv
 import httpx
+
+load_dotenv()
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
