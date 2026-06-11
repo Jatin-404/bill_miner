@@ -28,6 +28,8 @@ OCR_CONF_THRESH    = float(os.getenv("OCR_CONF_THRESH", "0.4"))
 MAX_IMAGE_PX       = int(os.getenv("MAX_IMAGE_PX", "1600"))
 OCR_TRIM_LINES     = int(os.getenv("OCR_TRIM_LINES", "15"))
 OCR_TRIM_MIN_CHARS = int(os.getenv("OCR_TRIM_MIN_CHARS", "1500"))
+PDF_RENDER_DPI     = int(os.getenv("PDF_RENDER_DPI", "200"))
+PDF_MIN_TEXT_CHARS = int(os.getenv("PDF_MIN_TEXT_CHARS", "80"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -57,8 +59,9 @@ class ExtractResponse(BaseModel):
 
 # ─── PaddleOCR: version-aware singleton ───────────────────────────────────────
 
-_ocr_engine  = None
-_paddle_major = 2          # filled in by get_ocr()
+_ocr_engine     = None   # image uploads (orientation OFF)
+_ocr_engine_pdf = None   # PDF image path (orientation ON)
+_paddle_major   = 2      # filled in by get_ocr()
 
 
 def _detect_paddle_major() -> int:
@@ -78,8 +81,8 @@ def _rec_model_name() -> str:
 
 def get_ocr():
     """
-    Lazy singleton.  Handles PaddleOCR v2 and v3 which have different __init__
-    signatures — v3 removed show_log / use_gpu / enable_mkldnn.
+    Lazy singleton for image uploads.
+    Orientation classify is OFF — EXIF handles phone photos; receipts are flat.
     """
     global _ocr_engine, _paddle_major
     if _ocr_engine is not None:
@@ -91,7 +94,6 @@ def get_ocr():
     from paddleocr import PaddleOCR
 
     if _paddle_major >= 3:
-        # v3.x — hybrid: accurate server det + lang-specific mobile rec
         _ocr_engine = PaddleOCR(
             lang=OCR_LANG,
             enable_mkldnn=False,
@@ -101,7 +103,6 @@ def get_ocr():
             text_recognition_model_name=_rec_model_name(),
         )
     else:
-        # v2.x — richer init options
         _ocr_engine = PaddleOCR(
             use_angle_cls=True,
             lang=OCR_LANG,
@@ -112,6 +113,43 @@ def get_ocr():
 
     log.info("PaddleOCR ready.")
     return _ocr_engine
+
+
+def get_ocr_pdf():
+    """
+    Lazy singleton for PDF image path.
+    Orientation classify is ON — PDFs can embed rotated scans with no EXIF.
+    """
+    global _ocr_engine_pdf, _paddle_major
+    if _ocr_engine_pdf is not None:
+        return _ocr_engine_pdf
+
+    if _paddle_major == 2:
+        _paddle_major = _detect_paddle_major()
+
+    from paddleocr import PaddleOCR
+
+    log.info("Loading PDF OCR engine (orientation classify enabled) …")
+    if _paddle_major >= 3:
+        _ocr_engine_pdf = PaddleOCR(
+            lang=OCR_LANG,
+            enable_mkldnn=False,
+            use_doc_orientation_classify=True,
+            use_doc_unwarping=False,
+            text_detection_model_name="PP-OCRv5_server_det",
+            text_recognition_model_name=_rec_model_name(),
+        )
+    else:
+        _ocr_engine_pdf = PaddleOCR(
+            use_angle_cls=True,
+            lang=OCR_LANG,
+            use_gpu=False,
+            show_log=False,
+            enable_mkldnn=True,
+        )
+
+    log.info("PDF OCR engine ready.")
+    return _ocr_engine_pdf
 
 
 # ─── Image pre-processing ─────────────────────────────────────────────────────
@@ -127,16 +165,89 @@ def preprocess(image_bytes: bytes) -> np.ndarray:
     return np.array(img)
 
 
+# ─── PDF handling ─────────────────────────────────────────────────────────────
+
+def pdf_to_ocr_text(pdf_bytes: bytes) -> str:
+    """
+    Extract text from a single-page receipt PDF.
+
+    Strategy:
+      1. Enforce single-page rule (400 if multi-page).
+      2. Try native text layer — if >= PDF_MIN_TEXT_CHARS, send straight to LLM.
+      3. Otherwise render to image at PDF_RENDER_DPI and run PaddleOCR with
+         orientation classify enabled (handles rotated scans).
+
+    Returns plain OCR/text string ready for the LLM.
+    """
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        raise HTTPException(500, "pypdfium2 not installed — cannot process PDFs.")
+
+    try:
+        doc = pdfium.PdfDocument(pdf_bytes)
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid or corrupt PDF: {exc}")
+
+    page_count = len(doc)
+    if page_count != 1:
+        raise HTTPException(
+            400,
+            f"Only single-page PDFs are supported. Got {page_count} page(s). "
+            "Please export the receipt as a 1-page PDF.",
+        )
+
+    page = doc[0]
+
+    # ── Try native text layer first (digital PDF, not scan) ──────────────────
+    try:
+        textpage = page.get_textpage()
+        native_text = textpage.get_text_range().strip()
+    except Exception:
+        native_text = ""
+
+    if len(native_text) >= PDF_MIN_TEXT_CHARS:
+        log.info("PDF: native text layer (%d chars) — skipping OCR", len(native_text))
+        return native_text
+
+    log.info(
+        "PDF: text layer too short (%d chars) — rendering at %d DPI for OCR",
+        len(native_text), PDF_RENDER_DPI,
+    )
+
+    # ── Render page to image ─────────────────────────────────────────────────
+    # pypdfium2 base is 72 DPI; scale up to PDF_RENDER_DPI for readable text
+    scale = PDF_RENDER_DPI / 72.0
+    bitmap = page.render(scale=scale)
+    pil_img = bitmap.to_pil().convert("RGB")
+
+    # Resize to MAX_IMAGE_PX (same as normal image path)
+    w, h = pil_img.size
+    resize_scale = MAX_IMAGE_PX / max(w, h)
+    if resize_scale < 1.0:
+        pil_img = pil_img.resize(
+            (int(w * resize_scale), int(h * resize_scale)), Image.LANCZOS
+        )
+
+    img_arr = np.array(pil_img)
+
+    # ── OCR with orientation detection (handles rotated scan PDFs) ───────────
+    return run_ocr(img_arr, engine=get_ocr_pdf())
+
+
 # ─── OCR runner — handles v2 and v3 output formats ────────────────────────────
 
-def run_ocr(img_arr: np.ndarray) -> str:
+def run_ocr(img_arr: np.ndarray, engine=None) -> str:
     """
     Run OCR and return reconstructed plain text.
 
     PaddleOCR v2  →  ocr(img, cls=True)  →  list[ list[ [bbox,(text,conf)] ] ]
     PaddleOCR v3  →  predict(img)        →  list[ dict{dt_polys, rec_texts, …} ]
+
+    Pass a custom engine (e.g. get_ocr_pdf()) to override the default singleton.
     """
-    engine = get_ocr()
+    if engine is None:
+        engine = get_ocr()
     blocks = []
 
     if _paddle_major >= 3:
@@ -361,7 +472,8 @@ def _to_float(v) -> Optional[float]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_ocr()          # warm up on startup
+    get_ocr()          # warm image OCR engine
+    get_ocr_pdf()      # warm PDF OCR engine (orientation classify)
     yield
 
 
@@ -379,21 +491,34 @@ async def extract_receipt(
     file:  UploadFile = File(...),
     debug: bool       = Query(False, description="Include raw OCR text in response"),
 ):
-    allowed = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
-    if (file.content_type or "").lower() not in allowed:
-        raise HTTPException(415, f"Unsupported type '{file.content_type}'. Use JPEG/PNG/WEBP.")
+    allowed = {"image/jpeg", "image/jpg", "image/png", "image/webp", "application/pdf"}
+    content_type = (file.content_type or "").lower()
+    if content_type not in allowed:
+        raise HTTPException(
+            415,
+            f"Unsupported type '{file.content_type}'. Use JPEG, PNG, WEBP, or PDF.",
+        )
 
-    image_bytes = await file.read()
-    if not image_bytes:
+    file_bytes = await file.read()
+    if not file_bytes:
         raise HTTPException(400, "Empty file.")
 
     t0 = time.monotonic()
 
-    # Step 1 — OCR
+    # Step 1 — OCR (image path) or PDF extraction
     t_ocr = time.monotonic()
     try:
-        img_arr  = preprocess(image_bytes)
-        ocr_text = run_ocr(img_arr)
+        if content_type == "application/pdf":
+            # PDF: text-first, then OCR with orientation if needed
+            import asyncio
+            ocr_text = await asyncio.get_event_loop().run_in_executor(
+                None, pdf_to_ocr_text, file_bytes
+            )
+        else:
+            img_arr  = preprocess(file_bytes)
+            ocr_text = run_ocr(img_arr)
+    except HTTPException:
+        raise
     except Exception as exc:
         log.exception("OCR stage failed")
         raise HTTPException(500, f"OCR error: {exc}")
